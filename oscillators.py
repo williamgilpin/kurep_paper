@@ -1,10 +1,6 @@
 """
 An efficient library for simulating the Kuramoto model and variations using Python
 
-NOTE: Code frozen 5.31.2019 in order to remain static for peer review. 
-Updated oscillator code for future projects available in another repository
-
-
 Depending on availability and settings, can use either vectorized Numpy, 
 JIT compiled Numpy (via Numba), or compiled stepper functions (via Cython)
 
@@ -16,8 +12,7 @@ Requirements
 + Cython (optional)
 
 Development:
-Add in analytical forms of Jacobians, this should speed up integration depending on solver
-See [here](https://github.com/Jonas77/Kuramoto2)
+Add in analytical forms of Jacobians, to see whether this speeds up the numerical integration
 
 """
 import warnings
@@ -36,18 +31,6 @@ except ModuleNotFoundError:
         return func
     def njit(func):
         return func
-
-try:
-    from oscillator_funcs import DiffEq
-    has_c = True
-except ModuleNotFoundError:
-    warnings.warn("Compiled Cython library not found, some functions will run slower")
-
-
-
-
-
-    
 
 def find_daido(phase_vals, n=1, coord='polar'):
     """
@@ -75,43 +58,50 @@ def find_daido(phase_vals, n=1, coord='polar'):
         return r, th
 
 
-@jit
-def heun_solver(yprime, y0, tpts):
+@njit
+def ang_dist(ang1, ang2, signed=False):
     """
-    A Python implementation of Heun's method (RK2) in 1D
+    Find the absolute distance between two angles, 
+    which can be at most pi.
+    
+    DEV: is there a reasonable heuristic for determining
+    the sign? Possible just the sign of the raw difference
+    times the output
+    
+    Args:
+        ang1, ang2: np.arrays 
+        signed: bool. **Not yet implemented**. If True, returns a 
+            signed distance in the form ang2 - ang1
+    Returns: 
+        out: array of distances between the two arrays, with
+            dimension determined by numpy broadcasting rules
     """
-    dt = tpts[1] - tpts[0]
-    npts = len(tpts)
-    tpts= np.append(tpts, tpts[-1] + dt)
-    sol = np.zeros((npts, len(y0)))
-    sol[0, :] = y0
-    ycurr = y0
-    for ii in range(1, npts):
-        ypp = yprime(ycurr, tpts[ii])
-        yt = ycurr + dt*ypp
-        ycurr = ycurr + (dt/2)*(ypp + yprime(yt, tpts[ii + 1]))
-        sol[ii, :] = ycurr
-    return sol
+    t = ang1 - ang2
+    out = np.abs(np.arctan2(np.sin(t), np.cos(t)))
+    return  out
 
-@jit
-def rk4_solver(yprime, y0, tpts):
+@njit
+def mod_c(arr, n):
     """
-    A Python implementation of the fourth-order Runge-Kutta method in 1D
+    The signed mod along a circle of circumference n
     """
-    dt = tpts[1] - tpts[0]
-    npts = len(tpts)
-    tpts= np.append(tpts, tpts[-1] + dt)
-    sol = np.zeros((npts, len(y0)))
-    sol[0, :] = y0
-    ycurr = y0
-    for ii in range(1, npts):
-        k1 = yprime(ycurr, tpts[ii])
-        k2 = yprime(ycurr + k1/2, tpts[ii] + dt/2)
-        k3 = yprime(ycurr + k2/2, tpts[ii] + dt/2)
-        k4 = yprime(ycurr + k3, tpts[ii] + dt)
-        ycurr = ycurr + (dt/6)*(k1 + 2*k2 + 2*k3 + k4)
-        sol[ii, :] = ycurr
-    return sol
+    return np.mod(arr-n/2, n) - n/2
+
+def is_overlap(ang1, ang2, rad):
+    """
+    Do two angles fall within rad of each other on a circle?
+
+    ang1, ang2 : both 1xN or Nx1 vectors
+    rad : 1xN or Nx1 or scalar list of distances
+    """
+    # flag = False
+    # if ang_dist(ang1, ang2)<rad:
+        # flag = True
+    # else:
+        # flag = False
+    # return flag
+    out = ang_dist(ang1, ang2)<rad
+    return out
 
 
 @njit
@@ -125,7 +115,7 @@ def dsoft_square(x, rad, hardness=50):
     return -(hardness/rad)*np.exp(-(x/rad)**hardness)*(x/rad)**(hardness-1)
 
 @njit
-def dsoft_triangle(x, rad, hardness=50):
+def dtriangle_repel(x, rad, hardness=50):
     """
     Approximate the derivative of a unit triangular potential 
     using two softened square pulses
@@ -145,33 +135,115 @@ def dsoft_triangle(x, rad, hardness=50):
     p2 = (1/rad)*np.exp(-((x + rad/2)/(rad/2))**hardness)
     out = p1 - p2
     return out
+
+@njit
+def dgaussian_repel(x, std0):
+    """
+    Calculate derivative of a truncated gaussian 
+    repulsive potential
+    """
+    # derivative of PDF
+    #val = x*np.exp(-(x**2)/((2*std)**2))
+    #pre = 1/((std**3)*np.sqrt(2*np.pi)) #proper
+    
+    # rescale to be independent of width
+    std = std0/4
+    val = x*np.exp(-(x**2)/((2*std)**2))
+    pre = 1/((std**2)*np.sqrt(2*np.pi)) #rescaled
+    out = pre*val
+    
+    # cut off large radii (not necessary)
+    # out = out*soft_square(x, 5*std, hardness=50)
+    
+    return out
+
+@njit
+def ddgaussian_repel(x, std0):
+    """
+    Calculate derivative of a truncated gaussian 
+    repulsive potential
+    """
+    std = std0
+    out = -(8*np.sqrt(2/np.pi)*(8*x**2 - std**2))/(np.exp((4*x**2)/std**2)*std**4)
+    return out
+
+
+@njit
+def dcauchy_repel(x, std):
+    """
+    Calculate derivative of a Cauchy repulsive potential. 
+    The width is rescaled by a numerical prefactor, in order to match
+    the width of an equivalent Gaussian distribution
+    """
+    # derivative of PDF
+    #return (2*x)/(std**3*np.pi*(1 + (x/std)**2)**2) 
+    
+    # empirically rescale to match size/width of Gaussian
+    std = std/2
+    pre=3.3105
+    out = pre*(2*x)/(std**2*np.pi*(1 + (x/std)**2)**2) # rescaled
+    
+    # cut off large radii (not necessary)
+    # out = out*soft_square(x, 5*std, hardness=50)
+    
+    return out 
+
+@njit
+def ddcauchy_repel(x, std):
+    """
+    Calculate derivative of a Cauchy repulsive potential. 
+    The width is rescaled by a numerical prefactor, in order to match
+    the width of an equivalent Gaussian distribution
+    """
+    std = std/2
+    pre= 3.3105/np.pi
+    out = pre*(2*std**2)*(std**2 - 3*x**2)/(x**2 + std**2)**3
+    return out 
+
     
 class CoupledOscillators(object):
     """
-    Define and simulate a system of coupled oscillators
+    Simulate a system of coupled oscillators
+    
+    Parameters
+    ----------
+    n_osc : int
+        The total number of oscillators
+    w_vals : np.array 
+        Oscillator natural frequencies
+    k_matrix : (n_osc x n_osc) np.array. 
+        A matrix specifying the couplings among oscillators. This does not need to be 
+        normalized by the number of oscillators
+    a_vec : ndarray
+        n_osc array of fixed phase offsets for the array
+    coupling : str 
+        The type of dynamical equation
+    repulsion : {None, "gaussian", "cauchy"}
+        The type of short-range repulsion to use
+    repel_val : float
+        If using Kuramoto with repulsion, the amplitude of the repulsive term
+    repel_length : float
+        The distance over which repulsion acts (in units of 2 pi/n_osc)
+    hardness : float
+        the stiffness of the repulsive term
     """
 
-    def __init__(self, n_osc, w_vals, k_matrix, 
-                 a_vec=[0.0], coupling='kuramoto', use_c=False, 
-                 repel_val=1.0, repel_length=1, num_repel=1, hardness=50):
-        """
-        Args:
-            n_osc : int for the total number of oscillators
-            w_vals : np.array of oscillator natural frequencies
-            k_matrix : (n_osc x n_osc) np.array. A matrix specifying 
-                    the couplings among oscillators. This does not need to be normalized
-                    by the number of oscillators
-            a_vec : n_osc array of fixed phase offsets for the array
-            coupling : str for the type of dynamical equation
-            use_c : bool. if True, uses Cython or an C++ library to represent the ODE
-            repel_val : if using Kuramoto with repulsion, the amplitude of the repulsive term
-            repel_length : the distance over which repulsion acts (in units of 2 pi/n_osc)
-            hardness : the stiffness of the repulsive term
-        """
+    def __init__(self, 
+                 n_osc, 
+                 w_vals, 
+                 k_matrix, 
+                 a_vec=[0.0], 
+                 repulsion="gaussian", 
+                 repel_val=1.0, 
+                 repel_length=1, 
+                 num_repel=1, 
+                 hardness=50, 
+                 **kwargs):
         
         if not (k_matrix.shape[0] == k_matrix.shape[1] == n_osc):
             warnings.warn("Coupling matrix unequal to number of oscillators")
         
+        self.w = w_vals
         self.n = n_osc
         self.k = k_matrix
         self.lonely_dist = 2*np.pi/n_osc
@@ -181,152 +253,149 @@ class CoupledOscillators(object):
         
         if len(a_vec) == 1:
             a_vec = a_vec*np.ones(n_osc)
-
-        if use_c and has_c:
-            self.c_flag = True
-        else:
-            self.c_flag = False
-            if use_c:
-                warnings.warn("")
-
-        
-        if coupling == 'kuramoto':
+    
+        if not repulsion:
+            @njit
+            def ndot(phase_vals, tvals):
+                """
+                Kuramoto model
+                """
+                # phase_vals = np.mod(phase_vals, 2*np.pi)
+                phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
+                sin_diff = np.sin(phase_diff)
+                return w_vals + (1/n_osc)*np.sum(k_matrix*sin_diff, axis=1)
             
-            if self.c_flag:
-                ndot = DiffEq(w_vals, k_matrix, a_vec, model="kuramoto")
+            @njit
+            def jac(phase_vals, tvals):
+                """
+                Jacobian function for the dynamical equation
+                """
+                phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
 
-            else:
-                @njit
-                def ndot(phase_vals, tvals):
-                    """
-                    Automatically generated function for the dynamical equation
-                    """
-                    # phase_diff = phase_vals[:,np.newaxis].T - phase_vals[:,np.newaxis] - (a_vec[:,np.newaxis])
-                    phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
-                    sin_diff = np.sin(phase_diff)
-                    
-                    return w_vals + (1/n_osc)*np.sum(k_matrix*sin_diff, axis=1)
+                cos_diff = (1/n_osc)*k_matrix*np.cos(phase_diff)
+                row_sum = np.sum(cos_diff, axis=1) - np.diag((1/n_osc)*k_matrix)
 
-                @njit
-                def jac(phase_vals, tvals):
-                    """
-                    Automatically generated jacobian function for the dynamical equation
-                    """
-                    # phase_diff = phase_vals[:,np.newaxis].T - phase_vals[:,np.newaxis] - (a_vec[:,np.newaxis])
-                    phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
+                out = cos_diff
+                #out[np.diag_indices(n_osc)] = -row_sum
+                out = out*(1 - np.identity(n_osc)) + -row_sum*np.identity(n_osc)
+                return out
 
-                    cos_diff = k_matrix*np.cos(phase_diff)
-                    row_sum = np.sum(cos_diff, axis=1)-1
-
-                    out = cos_diff
-                    out[np.diag_indices(n_osc)] = -row_sum
-
-                    return out
-
-        elif coupling == 'kuramoto_single_repulsion':
-
-            if self.c_flag:
-                ndot = DiffEq(w_vals, k_matrix, a_vec, model="kuramoto_single_repulsion",
-                        repel_length=repel_length, num_repel=num_repel, 
-                        repel_val=repel_val, hardness=hardness)
-
-            else:
-                where_repel = range(num_repel)
-                mask_arr = np.zeros((n_osc, n_osc))
-
-                for ind in where_repel:
-                    mask_arr[ind, :] = 1
-                    mask_arr[:, ind] = 1
-                    mask_arr[ind, ind] = 0
-
-                @njit
-                def ndot(phase_vals, tvals):
-                    """
-                    Automatically generated function for the dynamical equation
-                    """
-
-                    phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
-                    sin_diff = np.sin(phase_diff)
-                    
-                    phase_diff = np.fmod(phase_diff, 2*np.pi)
-                    repel_term = repel_val*dsoft_triangle(phase_diff, repel_length*2*np.pi/n_osc, hardness)
-                    repel_term = repel_term*mask_arr
-
-                    return w_vals + (1/n_osc)*np.sum(k_matrix*sin_diff, axis=1) - (1/num_repel)*np.sum(repel_term, axis=1)  
-
-                ## this is missing a term:
-                @njit
-                def jac(phase_vals, tvals):
-                    """
-                    Automatically generated jacobian function for the dynamical equation
-                    """
-                    phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
-
-                    cos_diff = k_matrix*np.cos(phase_diff)
-                    row_sum = np.sum(cos_diff, axis=1)-1
-
-                    out = cos_diff
-                    out[np.diag_indices(n_osc)] = -row_sum
-                    return out
-
-        else:
+        elif repulsion=="hard":
             @njit
             def ndot(phase_vals, tvals):
                 """
                 Automatically generated function for the dynamical equation
                 """
-                return w_vals
+                phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
+                sin_diff = np.sin(phase_diff)
 
+                phase_diff = mod_c(phase_diff, 2*np.pi) # correct way
+
+                repel_term = repel_val*dtriangle_repel(phase_diff, repel_length*2*np.pi/n_osc)
+                return w_vals + (1/n_osc)*np.sum(k_matrix*sin_diff, axis=1) - (1/num_repel)*np.sum(repel_term, axis=1) 
             @njit
             def jac(phase_vals, tvals):
                 """
-                Jacobian of the above function
+                Jacobian function for the dynamical equation (not implemented)
                 """
-                return np.zeros((n_osc,n_osc))
-            warnings.warn("Dynamical equation type not recognized, no coupling used.")
-        
-        self.dyn_eq = ndot
-        self.jac = 0#jac
+                phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
 
-    def run_simulation(self, y0, tvals, method='odeint'):
-        """
-        Simulate the system using odeint's built in solver
-        """
-        if method == "odeint":
-            sol = spi.odeint(self.dyn_eq, y0, tvals, args=())
-
-        elif method == "ode":
+                cos_diff = (1/n_osc)*k_matrix*np.cos(phase_diff)
+                phase_diff = mod_c(phase_diff, 2*np.pi) # correct way
+                
+                interaction_term = cos_diff #- repel_term
+                np.fill_diagonal(interaction_term, 0)
+                row_sum = np.sum(interaction_term, axis=1)
+                
+                out = cos_diff
+                #out[np.diag_indices(n_osc)] = -row_sum
+                out = out*(1 - np.identity(n_osc)) + -row_sum*np.identity(n_osc)
+                return out
             
-            f = lambda x, y: self.dyn_eq(y,x)
-            ode = spi.ode(f)
-            dt = tvals[1] - tvals[0]
+        elif repulsion=="gaussian":
+            @njit
+            def ndot(phase_vals, tvals):
+                """
+                Automatically generated function for the dynamical equation
+                """
+                phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
+                sin_diff = np.sin(phase_diff)
 
-            # BDF method suited to stiff systems of ODEs
-            ode.set_integrator('vode', nsteps=len(tvals), method='bdf')
-            ode.set_initial_value(y0, tvals[0])
+                phase_diff = mod_c(phase_diff, 2*np.pi) # correct way
 
-            ts = []
-            ys = []
-            while ode.successful() and ode.t < tvals[-1]:
-                ode.integrate(ode.t + dt)
-                ts.append(ode.t)
-                ys.append(ode.y)
+                repel_term = repel_val*dgaussian_repel(phase_diff, repel_length*2*np.pi/n_osc)
+                return w_vals + (1/n_osc)*np.sum(k_matrix*sin_diff, axis=1) - (1/num_repel)*np.sum(repel_term, axis=1) 
+            @njit
+            def jac(phase_vals, tvals):
+                """
+                Jacobian function for the dynamical equation (not implemented)
+                """
+                phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
 
-            t = np.vstack(ts)
-            sol = np.vstack(ys)
-            
-        elif method == "heun":
-            sol = heun_solver(self.dyn_eq, y0, tvals)
+                cos_diff = (1/n_osc)*k_matrix*np.cos(phase_diff)
+                phase_diff = mod_c(phase_diff, 2*np.pi) # correct way
+                repel_term = repel_val*ddgaussian_repel(phase_diff, repel_length*2*np.pi/n_osc)
+                
+                interaction_term = cos_diff - repel_term
+                np.fill_diagonal(interaction_term, 0)
+                row_sum = np.sum(interaction_term, axis=1)
 
-        elif method == "rk4":
-            sol = rk4_solver(self.dyn_eq, y0, tvals)
+                out = cos_diff
+                #out[np.diag_indices(n_osc)] = -row_sum
+                out = out*(1 - np.identity(n_osc)) + -row_sum*np.identity(n_osc)
+                return out
 
+        elif repulsion=="cauchy":
+            @njit
+            def ndot(phase_vals, tvals):
+                """
+                Automatically generated function for the dynamical equation
+                """
+                phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
+                sin_diff = np.sin(phase_diff)
+
+                phase_diff = mod_c(phase_diff, 2*np.pi) # correct way
+
+                repel_term = repel_val*dcauchy_repel(phase_diff, repel_length*2*np.pi/n_osc)
+                return w_vals + (1/n_osc)*np.sum(k_matrix*sin_diff, axis=1) - (1/num_repel)*np.sum(repel_term, axis=1) 
+            @njit
+            def jac(phase_vals, tvals):
+                """
+                Jacobian function for the dynamical equation (not implemented)
+                """
+                phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
+
+                cos_diff = (1/n_osc)*k_matrix*np.cos(phase_diff)
+                phase_diff = mod_c(phase_diff, 2*np.pi) # correct way
+                repel_term = repel_val*ddcauchy_repel(phase_diff, repel_length*2*np.pi/n_osc)
+                
+                interaction_term = cos_diff - repel_term
+                np.fill_diagonal(interaction_term, 0)
+                row_sum = np.sum(interaction_term, axis=1)
+
+                out = cos_diff
+                #out[np.diag_indices(n_osc)] = -row_sum
+                out = out*(1 - np.identity(n_osc)) + -row_sum*np.identity(n_osc)
+                return out
         else:
-            warnings.warn("Solution method not recognized, falling back to odeint")
-            sol = spi.odeint(self.dyn_eq, y0, tvals, args=())
-
-        return sol
-
+            warnings.warn("repulsion method not recognized, defaulting to no repulsion.")
+            @njit
+            def ndot(phase_vals, tvals):
+                """
+                Kuramoto model
+                """
+                # phase_vals = np.mod(phase_vals, 2*np.pi)
+                phase_diff = phase_vals.reshape((1, -1)) - phase_vals.reshape((-1, 1)) - a_vec.reshape((-1, 1))
+                sin_diff = np.sin(phase_diff)
+                return w_vals + (1/n_osc)*np.sum(k_matrix*sin_diff, axis=1)
+            @njit
+            def jac(phase_vals, tvals):
+                """
+                Jacobian function for the dynamical equation (not implemented)
+                """
+                return None
+        self.dyn_eq = ndot
+        self.jac = jac
 
     
 
