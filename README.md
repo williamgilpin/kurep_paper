@@ -1,6 +1,6 @@
 ## Kuramoto model with repulsion
 
-Source code available in `oscillators.py`
+Simulate coupled oscillators using the Kuramoto model with short-range repulsion.
 
 ## Quickstart
 
